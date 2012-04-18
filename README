@@ -1,0 +1,604 @@
+
+#include <stdio.h>
+#include <assert.h>
+#include <omp.h>
+
+#define CPU_READ  		0
+#define CPU_WRITE			1
+
+#define MSI_INVALID    	    0
+#define MSI_SHARED			1
+#define MSI_MODIFIED        2
+
+#define BUS_NULL			0
+#define BUS_READ			1
+#define BUS_WRITE			2        
+#define BUS_UPGRADE			3        // write with local shared(S) cache line
+#define BUS_REPLY			4
+#define BUS_WRITEBACK		5
+
+#define PHASE_ACTION        0
+#define PHASE_REACTION      1
+
+#define PRIORITY_NORMAL     0
+#define PRIORITY_HIGH       1
+
+#define CACHE_LINE_SIZE     4
+
+#define MAX_NPROC 			64
+#define MAX_CACHE_SIZE      4096
+#define MAX_TRACE_LEN       200000
+#define MAX_SIM_CYCLE 		MAX_TRACE_LEN * 10000 
+
+const char * bus_cmd_names []  = { "null     ", "read     ", "write    ", "write    ", "reply    ", "writeback" };
+const char * priority_names [] = { "normal", "high  " };
+const char * msi_names []      = { "I", "S", "M" };
+const char * phase_names []    = { "action  ", "reaction" };
+
+struct mem_rec {
+	int addr;
+	int cmd;
+};
+
+struct thread_state {
+	int pending_writeback_addr;
+	int pending_addr;
+	int pending_cmd;	
+	int completed_cycle;
+	int cache_hit_cnt;
+	int cache_miss_cnt;
+};
+
+struct cache_entry {
+	int tag;
+	int state;
+};
+
+struct bus_state {
+	int winner_id;					// can be CPU or memory
+	int winner_cmd;					// the bus command of the request
+	int winner_addr;				// the address of the request
+	
+	int priority;					// priority of the request
+	int last_winner_id;				// last winner of the bus (for arbitration)
+};
+
+int cache_size = 32;				// size of each cache
+int nproc = 4;						// # of threads
+int trace_len = 3;					// trace length
+
+int sim_cycle = 0;
+int thread_completion_cnt = 0;
+
+struct mem_rec gmem_trace[MAX_NPROC][MAX_TRACE_LEN] = {};
+struct thread_state thread_state[MAX_NPROC] = {};
+struct cache_entry gcache[MAX_NPROC][MAX_CACHE_SIZE] = {};
+struct bus_state gbus;
+
+// init
+void read_trace_file();
+void init_sim_states();
+
+// simulate
+void simulate();
+void simulate_memory(int thread_id);
+void simulate_thread(int thread_id);
+
+// cache related
+void generate_memory_instruction(int thread_id, struct thread_state * tstate);
+int cache_snooping(int thread_id, int cmd, int addr, struct thread_state * tstate);
+void update_cache(int thread_id, int cmd, int addr);
+
+// bus related
+int arbitrate_bus(int thread_id, int cmd, int addr, int priority, int phase);
+
+// output related
+void print_cache_states();
+void print_stat();
+
+int cfloor(int x, int a) { return (x & ~(a-1)); }
+
+int main(int argc, char ** argv) {	
+	read_trace_file();	
+	
+	init_sim_states();
+	
+	omp_set_num_threads(nproc+1);
+	
+	#pragma omp parallel
+	simulate();
+	
+	print_stat();
+}
+
+void read_trace_file() {		
+	int i = 0;
+	int j = 0;
+	int addr = 0;
+	int cpu_cmd = 0;
+	int K = 0;
+	scanf("%d %d %d \n", &nproc, &K, &trace_len);
+	
+	assert(trace_len < MAX_TRACE_LEN);
+	assert(nproc < MAX_NPROC);
+	
+	cache_size = 1 << K;
+		
+	for(i = 0; i < trace_len; i++) {
+		for(j = 0; j < nproc; j++) {
+			scanf("%d %d ", &addr, &cpu_cmd);
+			gmem_trace[j][i].addr = addr;
+			gmem_trace[j][i].cmd = cpu_cmd;
+		}
+		scanf("\n");
+	}
+}
+
+void init_sim_states() {	
+	int i, j;
+	
+	assert(nproc < MAX_NPROC);
+	assert(cache_size < MAX_CACHE_SIZE);
+	
+	for(i = 0; i < nproc; i++) {
+		thread_state[i].pending_writeback_addr = -1;
+		thread_state[i].pending_addr = -1;
+		thread_state[i].pending_cmd = 0;		
+		thread_state[i].completed_cycle = 0;
+		thread_state[i].cache_hit_cnt = 0;
+		thread_state[i].cache_miss_cnt = 0;
+	}
+	
+	for(i = 0; i < nproc; i++) {
+		for(j = 0; j < cache_size; j++) {
+			gcache[i][j].tag = -1;
+			gcache[i][j].state = MSI_INVALID;
+		}
+	}
+	
+	gbus.winner_id = 0;
+	gbus.winner_cmd = 0;
+	gbus.winner_addr = 0;
+	gbus.priority = PRIORITY_NORMAL;
+	gbus.last_winner_id = nproc-1;	      // thread-0 will be selected for the first bus transaction
+}
+
+void print_cache_states() {
+	int i = 0;
+	int j = 0;
+		
+	if (nproc > 4 || cache_size > 8) {
+		return;
+	}
+	
+	printf("cache state: \n");
+	for(j = 0; j < cache_size; j++) {
+		for(i = 0; i < nproc; i++) {
+			printf("%d %s, ", gcache[i][j].tag, msi_names[gcache[i][j].state]);
+		}
+		printf("\n");
+	}
+}
+
+void print_stat() {
+	int i;
+	
+	printf("completed cycle: ");
+	for(i = 0; i < nproc; i++) {
+		printf("%d, ", thread_state[i].completed_cycle);
+	}
+	printf("\n");
+	
+	printf("cache hits: ");
+	for(i = 0; i < nproc; i++) {
+		printf("%d, ", thread_state[i].cache_hit_cnt);
+	}
+	printf("\n");
+	
+	printf("cache misses: ");
+	for(i = 0; i < nproc; i++) {
+		printf("%d, ", thread_state[i].cache_miss_cnt);
+	}
+	printf("\n");
+	
+	printf("cache miss rate: ");
+	for(i = 0; i < nproc; i++) {
+		printf("%6.3f, ", ((double)thread_state[i].cache_miss_cnt) 
+						/ (thread_state[i].cache_miss_cnt + thread_state[i].cache_hit_cnt));
+	}
+	printf("\n");
+}
+
+void simulate() {
+	int my_tid = omp_get_thread_num();
+	
+	if (my_tid < nproc) {
+		simulate_thread(my_tid);
+	} else {
+		assert(my_tid == nproc);
+		simulate_memory(my_tid);
+	}
+	
+}
+
+void simulate_memory(int thread_id) {
+	int my_tid = thread_id;
+		
+	while(sim_cycle < MAX_SIM_CYCLE) {		
+		//action phase
+		arbitrate_bus(my_tid, BUS_NULL, -1, PRIORITY_NORMAL, PHASE_ACTION);
+		
+		if (gbus.winner_cmd == BUS_READ
+			|| gbus.winner_cmd == BUS_WRITE) {			
+			// memory feeds data with normal priority		
+			arbitrate_bus(my_tid, BUS_REPLY, gbus.winner_addr, PRIORITY_NORMAL, PHASE_REACTION);							
+		} else {			
+			arbitrate_bus(my_tid, BUS_NULL, -1, PRIORITY_NORMAL, PHASE_REACTION);
+		}		
+		
+		#pragma omp barrier		
+		
+		if (thread_completion_cnt == nproc) {			
+			#pragma omp critical	
+			printf("THD:%d completed \n", my_tid);			
+			break;
+		}
+	}
+}
+
+void generate_memory_inst(int thread_id, struct thread_state * tstate, int rec_idx) {
+	int trace_addr = -1;
+	int trace_cmd = 0;
+	int cache_addr = -1;
+	int cache_idx = -1;
+	
+	assert(tstate->pending_writeback_addr == -1);
+	assert(tstate->pending_addr == -1);
+	
+	assert(rec_idx < trace_len);
+		
+	trace_addr = gmem_trace[thread_id][rec_idx].addr;
+	trace_cmd = gmem_trace[thread_id][rec_idx].cmd;
+	
+	cache_addr = cfloor(trace_addr, CACHE_LINE_SIZE);
+	cache_idx = (cache_addr / CACHE_LINE_SIZE) % cache_size;
+	
+	if (trace_cmd == CPU_READ) {
+		if (cache_addr == gcache[thread_id][cache_idx].tag) {
+			assert(gcache[thread_id][cache_idx].state != MSI_INVALID);
+			// hit in cache
+			//printf("THD: %d addr %d read hit in cache \n", thread_id, cache_addr);
+			tstate->cache_hit_cnt++;
+			return;
+		} else {
+			// not hit in cache
+			tstate->pending_addr = cache_addr;
+			tstate->pending_cmd = BUS_READ;
+			tstate->cache_miss_cnt++;
+		}		
+	} else if (trace_cmd == CPU_WRITE) {
+		if (cache_addr == gcache[thread_id][cache_idx].tag) {
+			// hit in cache
+			
+			if (gcache[thread_id][cache_idx].state == MSI_MODIFIED) {
+				// direct write	
+			} else {
+				assert(gcache[thread_id][cache_idx].state == MSI_SHARED);
+				tstate->pending_addr = cache_addr;
+				tstate->pending_cmd = BUS_UPGRADE;   // notify other processors to invalidate their copies
+			}
+			
+			tstate->cache_hit_cnt++;			
+		} else {
+			// not hit in cache
+			tstate->pending_addr = cache_addr;
+			tstate->pending_cmd = BUS_WRITE;
+			tstate->cache_miss_cnt++;
+		}
+	} else {
+		assert(0);
+	}
+	
+	if (tstate->pending_addr != -1
+		&& gcache[thread_id][cache_idx].tag != tstate->pending_addr) {		
+		// need to load new cache line
+		
+		// check if old cache line needs writeback
+		if (gcache[thread_id][cache_idx].state == MSI_MODIFIED) {
+			tstate->pending_writeback_addr = gcache[thread_id][cache_idx].tag;
+			assert(tstate->pending_writeback_addr != -1);			
+		} else {
+			// invalid old cache line
+			gcache[thread_id][cache_idx].tag = -1;
+			gcache[thread_id][cache_idx].state = MSI_INVALID;
+		}
+	}
+}
+
+int cache_snooping(int thread_id, int cmd, int addr, struct thread_state * tstate) {
+	int cache_addr = cfloor(addr, CACHE_LINE_SIZE);
+	assert(cache_addr == addr);
+	
+	int cache_idx = (cache_addr / CACHE_LINE_SIZE) % cache_size;
+	int dirty_hit = 0;
+	
+	if (cache_addr != gcache[thread_id][cache_idx].tag) {
+		// cache line not hit
+		return 0;
+	}
+					
+	// cache line hit
+	if (gcache[thread_id][cache_idx].state == MSI_MODIFIED) {
+		dirty_hit = 1;
+			
+		// clear pending writeback
+		if (tstate->pending_writeback_addr == cache_addr) {
+			tstate->pending_writeback_addr = -1;
+			//printf("pending writeback addr snoop hit THD: %d, addr: %d\n", 
+			//	thread_id,  tstate->pending_snooping_writeback_addr);				
+		}		
+	}
+		
+	if (cmd == BUS_READ) {
+		gcache[thread_id][cache_idx].state = MSI_SHARED;
+	} else if (cmd == BUS_WRITE
+		|| cmd == BUS_UPGRADE) {
+		if (tstate->pending_cmd == BUS_UPGRADE
+			&& tstate->pending_addr == cache_addr) {
+			tstate->pending_cmd = BUS_WRITE;
+			
+			// the line has been invalidated by others
+			// the write will be a cache miss instead of a cache hit
+			tstate->cache_hit_cnt--;
+			tstate->cache_miss_cnt++;
+		}
+		
+		// invalidate this cache line
+		gcache[thread_id][cache_idx].tag = -1;
+		gcache[thread_id][cache_idx].state = MSI_INVALID;
+	}
+	
+	//printf("snoop hit. THD:%d addr:%d \n", thread_id, addr);
+	return dirty_hit;
+}
+
+void update_cache(int thread_id, int cmd, int addr) {
+	int cache_addr = cfloor(addr, CACHE_LINE_SIZE);
+	int cache_idx = (cache_addr / CACHE_LINE_SIZE) % cache_size;
+	
+	//printf("update cache: thd: %d cmd %s cache tag: %d, new addr: %d \n", 
+	//			thread_id, bus_cmd_names[cmd], gcache[thread_id][cache_idx].tag, cache_addr);
+	
+	if(gcache[thread_id][cache_idx].tag != -1
+		&& gcache[thread_id][cache_idx].tag != cache_addr) {
+		// it is possible, 
+		// a pending writeback request is cancelled due to a remote read
+		// the old line is still in S state
+		assert(cmd != BUS_WRITEBACK);		
+		assert(gcache[thread_id][cache_idx].state == MSI_SHARED);
+		
+		// reset cache line
+		gcache[thread_id][cache_idx].tag = -1;
+		gcache[thread_id][cache_idx].state = MSI_INVALID;
+	}
+	
+	if (cmd == BUS_WRITEBACK) {
+		assert(gcache[thread_id][cache_idx].tag == cache_addr);
+		assert(gcache[thread_id][cache_idx].state = MSI_MODIFIED);
+		
+		gcache[thread_id][cache_idx].tag = -1;
+		gcache[thread_id][cache_idx].state = MSI_INVALID;
+	} else if (cmd == BUS_UPGRADE) {		
+		assert(gcache[thread_id][cache_idx].tag == cache_addr);
+		assert(gcache[thread_id][cache_idx].state = MSI_SHARED);
+		
+		gcache[thread_id][cache_idx].state = MSI_MODIFIED;
+	} else if (cmd == BUS_WRITE) {
+		assert(gcache[thread_id][cache_idx].tag == -1);
+		
+		gcache[thread_id][cache_idx].tag = cache_addr;
+		gcache[thread_id][cache_idx].state = MSI_MODIFIED; 
+	} else if (cmd == BUS_READ) {
+		assert(gcache[thread_id][cache_idx].tag == -1);
+		
+		gcache[thread_id][cache_idx].tag = cache_addr;
+		gcache[thread_id][cache_idx].state = MSI_SHARED;		
+	} else {
+		assert(0);
+	}
+}
+
+void simulate_thread(int thread_id) {
+	int my_tid = thread_id;
+	struct thread_state * my_state = &thread_state[my_tid];
+	
+	int win_bus = 0;
+	int action_addr = -1;
+	int action_cmd = 0;
+	
+	int reaction_addr = -1;
+	int reaction_cmd = 0;
+	int priority = 0;	
+	int trace_rec_idx = 0;
+	
+	while(sim_cycle < MAX_SIM_CYCLE) {				
+		
+		if (my_state->pending_addr == -1) {
+			// optional writeback must be processed first
+			assert(my_state->pending_writeback_addr == -1);
+			
+			// check if more CPU commands to process
+			if (trace_rec_idx < trace_len) {				
+				// process one CPU command		
+				generate_memory_inst(my_tid, my_state, trace_rec_idx);
+				trace_rec_idx++;
+			}
+		}
+		
+		// get current BUS command to issue		
+		if (my_state->pending_writeback_addr != -1) {
+			// writeback will be processed first
+			action_cmd = BUS_WRITEBACK;
+			action_addr = my_state->pending_writeback_addr;			
+		} else if (my_state->pending_addr != -1) {
+			action_cmd = my_state->pending_cmd;
+			action_addr = my_state->pending_addr;
+		} else {
+			action_cmd = BUS_NULL;
+			action_addr = -1;			
+		}
+		
+		//active phase
+		win_bus = arbitrate_bus(my_tid, action_cmd, action_addr, PRIORITY_NORMAL, PHASE_ACTION);
+		
+		if (!my_state->completed_cycle			
+			&& trace_rec_idx == trace_len
+			&& action_cmd == BUS_NULL) {			
+			my_state->completed_cycle = sim_cycle;
+			
+			#pragma omp critical
+			{
+				thread_completion_cnt++;
+				printf("THD:%d completed \n", my_tid);
+			}
+		}
+				
+		if (win_bus) {			
+			if (action_cmd == BUS_WRITEBACK) {
+				reaction_cmd = action_cmd;
+				reaction_addr = action_addr;
+			} else {
+				// waiting for reply
+				reaction_cmd = BUS_NULL;
+				reaction_addr = -1;
+			}
+			priority = PRIORITY_NORMAL;
+				
+		} else {	
+			int dirty_hit = 0;		
+			if (gbus.winner_id != -1) {
+				// response to other thread's request				
+				dirty_hit = cache_snooping(my_tid, gbus.winner_cmd, gbus.winner_addr, my_state);				
+			}
+				
+			if (dirty_hit) {
+				reaction_cmd = BUS_REPLY;
+				reaction_addr = gbus.winner_addr;
+				priority = PRIORITY_HIGH;
+			} else {
+				reaction_cmd = BUS_NULL;
+				reaction_addr = -1;
+				priority = PRIORITY_NORMAL;		
+			}
+		}
+						
+		arbitrate_bus(my_tid, reaction_cmd, reaction_addr, priority, PHASE_REACTION);
+		
+		if (win_bus) {			
+			update_cache(my_tid, action_cmd, action_addr);
+			if (action_cmd == BUS_WRITEBACK) {
+				assert(my_state->pending_writeback_addr != -1);
+				my_state->pending_writeback_addr = -1;
+			} else {				
+				assert(my_state->pending_addr != -1);
+				my_state->pending_addr = -1;
+			}
+			gbus.last_winner_id = my_tid;
+		}
+							
+		#pragma omp master 
+		print_cache_states();
+		#pragma omp barrier
+		
+		// exit all threads after the barrier in arbitrate_bus
+		if (thread_completion_cnt == nproc) {			
+			break;
+		}
+	}
+}
+
+int is_higher_priority(int thread_id, int priority) {
+	if (gbus.winner_id == -1) {
+		return 1;	//no winner yet
+	}
+	
+	// at most one priority is high	
+	if (priority == PRIORITY_HIGH && gbus.priority == PRIORITY_NORMAL) {
+		return 1;
+	} else if (priority == PRIORITY_NORMAL && gbus.priority == PRIORITY_HIGH) {
+		return 0;
+	}
+	
+	assert(priority == PRIORITY_NORMAL);
+	assert(gbus.priority == PRIORITY_NORMAL);	
+	assert(thread_id <= nproc);
+	assert(thread_id >= 0);
+	assert(gbus.winner_id != thread_id);
+	
+	//compare the distance between the requesters and the last winner
+	int winner_offset = ( nproc + nproc + gbus.winner_id - (gbus.last_winner_id + 1)) % nproc;
+	int new_requester_offset = (nproc + nproc + thread_id - (gbus.last_winner_id + 1)) % nproc;
+	//printf("is_higher_priority: %d %d %d %d %d \n", thread_id, gbus.winner_id, gbus.last_winner_id, new_requester_offset, winner_offset);
+	
+	if (new_requester_offset < winner_offset) {
+		return 1;
+	} else {
+		assert(new_requester_offset > winner_offset);
+		return 0;
+	}
+}
+
+int arbitrate_bus(int thread_id, int cmd, int addr, int priority, int phase) {
+	
+	#pragma omp barrier
+	
+	#pragma omp single
+	{
+		// reset bus
+		gbus.winner_id = -1;
+		gbus.winner_addr = -1;
+		gbus.winner_cmd = 0;
+		gbus.priority = PRIORITY_NORMAL;	
+		
+		if (phase == PHASE_ACTION) {
+			sim_cycle++;		
+		}
+	}
+	
+//	printf("arbitrate bus: THD:%d CMD:%s ADDR:%d PRI:%s \n",
+//			thread_id,
+//			bus_cmd_names[cmd],
+//			addr,
+//			priority_names[priority]);
+	
+	if (cmd != BUS_NULL) {
+		#pragma omp critical
+		{
+			if (is_higher_priority(thread_id, priority)) {		
+				gbus.winner_id = thread_id;
+				gbus.winner_cmd = cmd;
+				gbus.winner_addr = addr;
+				gbus.priority = priority;
+			}
+		}
+	}
+	
+	#pragma omp barrier
+		
+	#pragma omp master
+	{		
+		printf("C:%d P:%s   THD:%d CMD:%s ADDR:%d PRI:%s\n", 
+			sim_cycle, 
+			phase_names[phase],
+			gbus.winner_id, 
+			bus_cmd_names[gbus.winner_cmd], 
+			gbus.winner_addr, 
+			priority_names[gbus.priority]);							
+	}
+
+	if (gbus.winner_id == thread_id) {
+		return 1;
+	}
+	
+	return 0;
+}
